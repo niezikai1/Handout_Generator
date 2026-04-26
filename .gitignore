@@ -1,0 +1,14 @@
+﻿# Python
+__pycache__/
+*.pyc
+.env
+
+# 输出文件
+output/
+
+# 数据
+data/raw_pdfs/
+data/problems.db
+
+# IDE
+.vscode/
