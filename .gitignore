@@ -8,7 +8,10 @@ output/
 
 # 数据
 data/raw_pdfs/
+data/gaokao/
 data/problems.db
 
 # IDE
 .vscode/
+.DS_Store
+CLAUDE.md

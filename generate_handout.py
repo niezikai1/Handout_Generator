@@ -1,12 +1,5 @@
 """
-generate_handout.py — 主程序 (v2: 教师版+学生版)
-
-流程：
-  1. 读取 data/raw_pdfs/ 下与topic相关的PDF全文
-  2. 连同格式模板一起喂给 DeepSeek-V4-Pro
-  3. LLM直接输出完整的教师版LaTeX（含答案）
-  4. 若需要学生版，后处理去掉答案，替换为空白答题区
-  5. xelatex编译为PDF
+generate_handout.py — v4 (高考真题文件夹支持)
 """
 import fitz
 import logging
@@ -15,32 +8,33 @@ import subprocess
 import shutil
 import sys
 import argparse
+import time as _time
 from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
+from tikz_templates import FIGURE_JSON_INSTRUCTION, inject_figures_into_latex
 import os
 
 load_dotenv()
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
 BASE_DIR    = Path(__file__).parent
 PDF_DIR     = BASE_DIR / "data" / "raw_pdfs"
+GAOKAO_DIR  = BASE_DIR / "data" / "gaokao"      # 高考真题专用文件夹
 TEX_DIR     = BASE_DIR / "output" / "tex"
 PDF_OUT_DIR = BASE_DIR / "output" / "pdf"
 
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
-MODEL            = "deepseek-v4-pro"
-MAX_TOKENS       = 163840
-LATEX_CMD        = r"C:\Users\Kevin\AppData\Local\Programs\MiKTeX\miktex\bin\x64\xelatex.exe"
-LATEX_OPTS       = ["-interaction=nonstopmode", "-halt-on-error"]
-MAX_RETRIES      = 3
+MODEL       = "deepseek-v4-pro"
+MAX_TOKENS  = 40000
+LATEX_CMD   = r"C:\Users\Kevin\AppData\Local\Programs\MiKTeX\miktex\bin\x64\xelatex.exe"
+LATEX_OPTS  = ["-interaction=nonstopmode", "-halt-on-error"]
+MAX_RETRIES = 3
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-# ── 课程大纲 ──────────────────────────────────────────────────────────────────
 SYLLABUS = {
     "直线方程": {"key_points": ["倾斜角与斜率", "五种直线方程形式", "点到直线距离", "两直线位置关系"], "module": "解析几何"},
     "直线方程综合": {"key_points": ["直线系方程", "对称问题", "最值问题", "综合应用"], "module": "解析几何"},
@@ -72,10 +66,23 @@ SYLLABUS = {
     "二项分布、超几何分布、正态分布": {"key_points": ["B(n,p)", "超几何分布", "N(μ,σ²)", "标准正态"], "module": "概率统计"},
     "相关性与回归模型": {"key_points": ["散点图", "相关系数", "回归方程", "最小二乘法"], "module": "概率统计"},
     "列联表与独立性检验": {"key_points": ["列联表", "χ²统计量", "独立性检验步骤"], "module": "概率统计"},
-    "AI_Agent": {"key_points": ["Prompt Engineering", "LangChain & LangGraph", "How to build a AI Agent yourself"], "module": "AI"},
+    "解析几何": {"key_points": ["椭圆综合", "双曲线综合", "解析几何难题综合"], "module": "解析几何"},
+    "圆锥曲线定值定点问题": {"key_points": ["定值问题的转化", "设点法与向量法", "参数消去", "定点坐标求法"], "module": "解析几何"},
+    "圆锥曲线范围最值问题": {"key_points": ["参数范围讨论", "基本不等式应用", "判别式法", "导数辅助"], "module": "解析几何"},
+    "圆锥曲线非对称韦达定理": {"key_points": ["非对称韦达定理", "弦中点问题", "斜率乘积定值", "综合应用"], "module": "解析几何"},
+    "暑期测验": {"key_points": ["解析几何综合", "概率统计综合", "压轴题训练", "限时模拟"], "module": "综合测验"},
+    "寒假测验": {"key_points": ["解析几何综合", "概率统计综合", "压轴题训练", "限时模拟"], "module": "综合测验"},
 }
 
-# ── LaTeX格式模板 ─────────────────────────────────────────────────────────────
+TIKZ_TOPICS = {
+        "椭圆方程","双曲线方程","抛物线方程","椭圆的几何性质",
+        "双曲线的几何性质","抛物线的几何性质","直线与椭圆",
+        "直线与抛物线","圆锥曲线综合","直线与圆","直线方程综合",
+        "曲线与方程","解析几何","圆锥曲线定值定点问题",
+        "圆锥曲线范围最值问题","圆锥曲线非对称韦达定理"
+}
+
+# ── LaTeX模板 ─────────────────────────────────────────────────────────────────
 LATEX_FORMAT_EXAMPLE = r"""
 \documentclass[a4paper,11pt]{article}
 \usepackage{geometry}
@@ -91,10 +98,17 @@ LATEX_FORMAT_EXAMPLE = r"""
 \usepackage[most]{tcolorbox}
 \usepackage{booktabs}
 \usepackage{multirow}
+\usepackage{makecell}
 \usepackage{enumitem}
 \usepackage{setspace}
 \usepackage{titlesec}
 \usepackage{needspace}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{pgfplots}
+% forest removed - using tikz child syntax instead
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{patterns, arrows.meta, positioning, calc, decorations.pathreplacing}
 \setstretch{1.6}
 \definecolor{lightgray}{gray}{0.95}
 \definecolor{midgray}{gray}{0.6}
@@ -113,23 +127,17 @@ LATEX_FORMAT_EXAMPLE = r"""
 }
 \titleformat{\section}[block]{\large\bfseries}{}{0em}{}[\vspace{-0.3em}\hrule\vspace{0.3em}]
 \titleformat{\subsection}[block]{\normalsize\bfseries}{}{0em}{}
-% ── 页面溢出防护 ────────────────────────────────────────────────────────────
-\allowdisplaybreaks          % 允许align*等公式环境跨页
-\emergencystretch 2em        % 自动拉伸字间距防止溢出
-\setlength{\textwidth}{16cm}
-\setlength{\textheight}{24cm}
+\allowdisplaybreaks
+\emergencystretch 2em
 \begin{document}
 \everymath{\displaystyle}
 
 \begin{center}
     {\LARGE\textbf{高中数学·直线方程}}
     \vspace{0.3cm}
-
     {\normalsize 解析几何模块 \quad|\quad 课时：60 min}
 \end{center}
-\vspace{0.2cm}
-\hrule
-\vspace{0.5cm}
+\vspace{0.2cm}\hrule\vspace{0.5cm}
 
 \section*{一、牛刀小试（5 min，先独立完成再对答案）}
 \begin{enumerate}[label=(\arabic*), itemsep=0.3cm]
@@ -143,22 +151,50 @@ LATEX_FORMAT_EXAMPLE = r"""
 
 \newpage
 \section*{二、本章知识框架}
+
+\begin{center}
+\begin{tikzpicture}[
+  grow=right,
+  every node/.style={draw, rounded corners, align=center, font=\small, text width=2.6cm},
+  level 1/.style={sibling distance=60mm, level distance=52mm,
+                  every node/.style={draw,rounded corners,align=center,font=\small,fill=midgray!30,text width=2.6cm,minimum height=8mm}},
+  level 2/.style={sibling distance=22mm, level distance=46mm,
+                  every node/.style={draw,rounded corners,align=center,font=\small,fill=lightgray,text width=2.4cm,minimum height=7mm}},
+  edge from parent/.style={draw, ->, thick}
+]
+\node[fill=darkgray!80, text=white, font=\bfseries\small, text width=2.4cm] {直线方程}
+  child { node {倾斜角与斜率}
+    child { node {$\alpha\in[0^\circ,180^\circ)$} }
+    child { node {$k=\tan\alpha$} }
+  }
+  child { node {方程五种形式}
+    child { node {点斜式} }
+    child { node {一般式} }
+  }
+  child { node {位置关系}
+    child { node {平行$k_1=k_2$} }
+    child { node {垂直$k_1k_2=-1$} }
+  };
+\end{tikzpicture}
+\end{center}
+
 \renewcommand{\arraystretch}{1.8}
 \begin{table}[h]
 \centering
 \rowcolors{2}{lightgray}{white}
-\begin{tabular}{p{2cm}p{5cm}p{3cm}p{4cm}}
+\begin{tabular}{p{2.5cm}p{5cm}p{3cm}p{3.5cm}}
 \toprule
-\textbf{形式} & \textbf{方程} & \textbf{已知条件} & \textbf{局限性} \\
+\textbf{形式} & \textbf{方程} & \textbf{条件} & \textbf{局限} \\
 \midrule
-点斜式 & $y-y_0=k(x-x_0)$ & 一点+斜率$k$ & 斜率不存在时不适用 \\
+点斜式 & $y-y_0=k(x-x_0)$ & 一点+斜率 & 斜率不存在时不适用 \\
 一般式 & $Ax+By+C=0$ & 通用 & 无局限 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \newpage
-\section*{三、知识点精讲 + 分类例题（由易到难）}
+\section*{三、知识点精讲 + 分类例题}
+
 \subsection*{3.1 直线的倾斜角与斜率}
 \begin{tcolorbox}[theorybox, title={核心要点}]
 \begin{itemize}[leftmargin=*]
@@ -167,25 +203,66 @@ LATEX_FORMAT_EXAMPLE = r"""
 \end{itemize}
 \end{tcolorbox}
 
-\needspace{20\baselineskip}
+\needspace{12\baselineskip}
 \noindent\textbf{例题 1——倾斜角范围}\\
-\textbf{【题目】} 若直线$l$的斜率$k\in[-\sqrt{3}, 1]$，求倾斜角$\alpha$的取值范围.
+\textbf{【题目】}（2023年全国乙卷）若直线$l$的斜率$k\in[-\sqrt{3}, 1]$，求倾斜角$\alpha$的取值范围.
 \begin{tcolorbox}[answerbox, title={【解题过程】}]
-分两段讨论...综合：$\alpha\in[0^\circ, 45^\circ]\cup(90^\circ, 120^\circ]$.
+分两段讨论. $k\in[0,1]$：$\alpha\in[0^\circ,45^\circ]$. $k\in[-\sqrt{3},0)$：$\alpha\in(90^\circ,120^\circ]$. 综合：$\alpha\in[0^\circ,45^\circ]\cup(90^\circ,120^\circ]$.
 \end{tcolorbox}
 \begin{tcolorbox}[tipbox, title={【易错点】}]
-$\Rightarrow$ 斜率范围$\neq$直接取$\arctan$！
+$\Rightarrow$ 斜率范围$\neq$直接取$\arctan$！需分段讨论再取并集.
+\end{tcolorbox}
+
+\needspace{8\baselineskip}
+\noindent\textbf{【选讲】例题 2——选讲加练题}\\
+\textbf{【题目】} 选讲题目内容...
+\begin{tcolorbox}[answerbox, title={【解题过程】}]
+解题步骤...
 \end{tcolorbox}
 
 \newpage
 \section*{四、本章综合例题}
 
-\needspace{25\baselineskip}
-\noindent\textbf{综合例题 1——题型名}\\
-\textbf{【题目】} 题目内容...
+% ===== 高考大题标准答案格式示范（所有综合例题必须严格参照此格式）=====
+\needspace{15\baselineskip}
+\noindent\textbf{综合例题 X——焦点三角形（此为格式示范，生成时替换为真实题目）}\\
+\textbf{【题目】}已知双曲线$C:\frac{x^2}{4}-\frac{y^2}{12}=1$的左、右焦点分别为$F_1$、$F_2$，点$P$在双曲线右支上，$PF_1\perp PF_2$，求$\triangle PF_1F_2$的面积.
 \begin{tcolorbox}[answerbox, title={【解题过程】}]
-解题步骤...
+由双曲线方程得$a^2=4$，$b^2=12$，故$a=2$，$c=\sqrt{a^2+b^2}=\sqrt{16}=4$，$|F_1F_2|=2c=8$.
+
+由于点$P$在双曲线右支上，由双曲线定义得：
+\begin{align*}
+|PF_1|-|PF_2|=2a=4.
+\end{align*}
+
+设$|PF_2|=t$（$t>c-a=2$，即$t>2$），则$|PF_1|=t+4$.
+
+由$PF_1\perp PF_2$，在直角$\triangle PF_1F_2$中，由勾股定理：
+\begin{align*}
+|PF_1|^2+|PF_2|^2&=|F_1F_2|^2\\
+(t+4)^2+t^2&=64\\
+2t^2+8t+16&=64\\
+t^2+4t-24&=0\\
+(t-4)(t+??)&=0\quad\text{（判别式}\ \Delta=16+96=112\text{）}\\
+t&=\frac{-4+\sqrt{112}}{2}=\frac{-4+4\sqrt{7}}{2}=2\sqrt{7}-2.
+\end{align*}
+
+验证：$t=2\sqrt{7}-2\approx3.29>2$，满足$t>2$，合法.
+
+故$|PF_2|=2\sqrt{7}-2$，$|PF_1|=2\sqrt{7}+2$.
+
+$\triangle PF_1F_2$的面积为：
+\begin{align*}
+S&=\frac{1}{2}|PF_1|\cdot|PF_2|\\
+&=\frac{1}{2}(2\sqrt{7}+2)(2\sqrt{7}-2)\\
+&=\frac{1}{2}(28-4)\\
+&=12.
+\end{align*}
+
+故$\triangle PF_1F_2$的面积为$\boldsymbol{12}$.
 \end{tcolorbox}
+% ===== 格式示范结束。要点：①设辅助变量并注明范围；②每步align*展开；
+%       ③验证合法性；④结论加粗单独成句；⑤禁止"过程略"或跳步 =====
 
 \newpage
 \section*{五、易错点 \& 考点速查}
@@ -202,15 +279,6 @@ $\Rightarrow$ 斜率范围$\neq$直接取$\arctan$！
 \end{tabular}
 \end{table}
 
-\newpage
-\section*{六、课堂练习（约 10 min，调节时间用）}
-\begin{enumerate}[label=(\arabic*), itemsep=0.4cm]
-    \item 练习题...
-\end{enumerate}
-\begin{tcolorbox}[answerbox, title={【练习参考答案】}]
-(1) 答案...
-\end{tcolorbox}
-
 \vspace{1cm}
 \begin{center}
     \color{midgray}\small 《直线方程》讲义 \(\cdot\) 解析几何模块 \(\cdot\) Author: 杨皓瑜
@@ -219,7 +287,6 @@ $\Rightarrow$ 斜率范围$\neq$直接取$\arctan$！
 """
 
 # ── PDF读取 ───────────────────────────────────────────────────────────────────
-
 def read_pdf_text(pdf_path: Path) -> str:
     try:
         doc = fitz.open(str(pdf_path))
@@ -234,15 +301,13 @@ def read_pdf_text(pdf_path: Path) -> str:
         log.warning(f"  读取PDF失败: {pdf_path.name} — {e}")
         return ""
 
-def collect_reference_texts(topic: str, pdf_dir: Path, max_chars: int = 800_000) -> str:
+def _collect_from_dir(topic: str, pdf_dir: Path, max_chars: int) -> str:
+    """从指定文件夹收集PDF文本，按topic关键词优先排序。"""
     pdfs = sorted(pdf_dir.glob("*.pdf"))
     if not pdfs:
-        log.warning(f"在 {pdf_dir} 中未找到PDF文件")
         return ""
-
     keywords = re.split(r"[与和的及综合、\s]", topic)
     keywords = [k for k in keywords if len(k) >= 2]
-
     priority, rest = [], []
     for p in pdfs:
         name = p.stem
@@ -250,11 +315,8 @@ def collect_reference_texts(topic: str, pdf_dir: Path, max_chars: int = 800_000)
             priority.append(p)
         else:
             rest.append(p)
-
-    ordered = priority + rest
     collected, total_chars = [], 0
-
-    for pdf in ordered:
+    for pdf in priority + rest:
         text = read_pdf_text(pdf)
         if not text:
             continue
@@ -266,62 +328,118 @@ def collect_reference_texts(topic: str, pdf_dir: Path, max_chars: int = 800_000)
         collected.append(f"=== {pdf.name} ===\n{text}")
         total_chars += len(text)
         log.info(f"  已加载: {pdf.name} ({len(text)}字符)")
-
-    log.info(f"  共加载 {len(collected)} 个PDF，总计 {total_chars} 字符")
     return "\n\n".join(collected)
 
-# ── Prompt ────────────────────────────────────────────────────────────────────
+def collect_reference_texts(topic: str, pdf_dir: Path, max_chars: int = 600_000) -> str:
+    """
+    收集参考资料。优先加载 data/gaokao/ 中的高考真题，
+    再加载 data/raw_pdfs/ 中的普通参考资料。
+    两部分在prompt中用标题隔开，让LLM知道哪些是真题。
+    """
+    half = max_chars // 2
 
+    # 1. 高考真题文件夹
+    gaokao_text = ""
+    if GAOKAO_DIR.exists() and any(GAOKAO_DIR.glob("*.pdf")):
+        log.info("  加载高考真题...")
+        gaokao_text = _collect_from_dir(topic, GAOKAO_DIR, half)
+
+    # 2. 普通参考资料
+    log.info("  加载普通参考资料...")
+    normal_text = _collect_from_dir(topic, pdf_dir, half if gaokao_text else max_chars)
+
+    # 拼接，真题优先且有明显标注
+    parts = []
+    if gaokao_text:
+        parts.append("=== 【高考真题资料】优先从此部分选取真题，注意核对年份 ===\n" + gaokao_text)
+    if normal_text:
+        parts.append("=== 【普通参考资料】===\n" + normal_text)
+
+    result = "\n\n".join(parts)
+    log.info(f"  参考资料总计 {len(result)} 字符（真题{'有' if gaokao_text else '无'}）")
+    return result
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """\
 你是一位顶尖的高中数学教师，专门编写高质量的课时讲义。
 你的讲义以逻辑清晰、内容充实、例题精选、易错点准确著称。
 你将根据参考资料和格式要求，输出完整的LaTeX讲义代码。"""
 
 def build_prompt(topic: str, module: str, key_points: list[str], reference: str) -> str:
-    return f"""请为「{topic}」编写一份内容丰富的60分钟高中数学课时讲义（LaTeX格式）。注意：讲义必须内容充实、题量充足。
+
+    need_tikz = topic in TIKZ_TOPICS
+
+    figure_rule = """
+   - 【配图规则——必须执行】每道例题解题过程结束后，立即判断：
+     ① 若题目中曲线的a、b均为已知具体数值（解题完成后能确定），必须紧接着输出一个```json图形描述块
+     ② 若题目最终求的是离心率、渐近线斜率等抽象量（a、b解完仍是字母），不输出JSON块
+     ③ JSON块必须紧跟在\\end{tcolorbox}之后，不得遗漏
+""" if need_tikz else ""
+
+    figure_format = ("\n" + FIGURE_JSON_INSTRUCTION) if need_tikz else ""
+
+    return f"""请为「{topic}」编写一份60分钟高中数学课时讲义（LaTeX格式）。{figure_format}
 
 【讲义要求】
 - 模块：{module}
 - 核心知识点：{'、'.join(key_points)}
-- 课时：60分钟
-- 对象：高中生
+- 课时：60分钟；对象：高中生
+- 整份讲义内容充实，例题和解题过程要详细，预计12-16页均可
 
-【讲义结构】（必须严格按此顺序，内容要充实）
-一、牛刀小试（5 min）：5-6道填空/选择，覆盖基础概念，附答案速查
-二、本章知识框架：用表格呈现核心公式、条件、注意事项（至少2个表格，内容完整）
-三、知识点精讲+分类例题（由易到难）：4-5个子节，每节含核心要点box + 至少2道例题（例题+解题过程+易错点）
-四、本章综合例题：3-4道压轴综合题，含完整解题过程，难度逐步上升
-五、易错点&考点速查：表格形式，至少8条易错点
-六、课堂练习（10 min）：8-10道练习题，覆盖各知识点，附参考答案
+【讲义结构】（必须严格按此顺序）
+一、牛刀小试（5 min）：4-5道填空/选择，附答案速查
+二、本章知识框架：
+   ① 用tikz的child语法画树状思维导图（严格参照格式模板中的tikz树状图示例，节点样式与示例完全一致，禁止使用forest包）
+   ② 再附1-2个知识速查表格
+三、知识点精讲+分类例题：4-5个子节，每节含：
+   - 核心要点box（theorybox）
+   - 2-3道普通例题（含解题过程+易错点），例题要详细完整{figure_rule}   - 1道【选讲】例题（标题前加"【选讲】"，根据课堂进度选用，难度略高）
+四、本章综合例题：3-4道压轴题，含完整详细解题过程，每道题解答不能简略{figure_rule}五、易错点&考点速查：表格，至少8条
+
+【高考真题要求——重要】
+- 参考资料中标注"【高考真题资料】"的部分是真实高考题，优先从这里选取
+- 每个知识点子节至少有1道高考真题，格式："（XXXX年XX卷）"，如"（2023年新高考全国卷I）"
+- 综合例题里至少有1道高考真题
+- 若找不到合适真题，直接出题即可，不需要任何标注，禁止编造年份
+- 真题文字可能有OCR错误，使用时请根据数学逻辑自行修正
 
 【题目要求】
-- 从下方【参考资料】中选取合适的题目，原题如果你认为出的好那就照搬原题，如果不好那么你可以适当修改但务必保证正确性
-- 题目质量优先，宁缺毋滥
-- 例题编号必须从"例题 1"开始重新编号，不要沿用参考资料里的原始编号
-- 难度梯度：牛刀小试→精讲例题→综合例题→练习题，由易到难
-- 解题过程只写最终正确的解法，不要写探索过程、不要出现"重新考虑""改用构造""不妨设"等思考痕迹
-- 解题过程必须详细，每步都要有
-- 解题过程中全程使用句点（.）而非中文句号（。）结尾
-
-【内容量要求】
-- 整份讲义应足够充实，例题和练习题要尽可能多，保证课堂容量
-- 每道例题的解题过程要详细完整，不能过于简略
-- 不要害怕页面变多，一份60min的讲义完全可以是10-15页甚至更多
+- 从参考资料中选取合适题目，质量优先
+- 例题编号从"例题 1"开始，不沿用参考资料编号
+- 难度梯度：牛刀小试→精讲例题→选讲例题→综合例题，由易到难
+- 解题过程只写最终正确解法，不写探索过程
+- 每一步推导必须数学严格，前后结论不能矛盾，不能出现"重新考虑""等等""检验发现"等字样
+- 每道例题的解题过程必须完整，禁止输出"略"或"留作练习"；如果发现题目描述不完整，请更换或修正题目后再撰写解答
+- 解题过程用句点（.）而非中文句号（。）结尾
+- 解题过程书写标准参照高考评分标准：每一个得分点单独成句，关键步骤不跳跃，中间推导完整写出；禁止"过程略"、"类似可得"、"计算可得"等替代语，所有计算结果必须显式推导到位
+- 综合例题解题过程必须严格参照【格式模板】中"综合例题X——焦点三角形"的格式示范：①设辅助变量时注明取值范围；②每步计算用align*环境逐行展开，不得跳步；③对解出的值验证合法性；④最终结论加粗单独成句以句点结尾
+- 如果某道综合题无法写出每步都正确的完整推导，必须立即换题，不得保留任何残缺解答，不需要说明换题原因
+- 涉及等腰三角形、对称性、分情况讨论的题目，必须在内部确定唯一正确
+  的情况后，直接以该情况开始解题，其余情况若需排除则用一句话说明矛盾
+  原因即可，不展开错误路径的计算
+- 若某道题在生成过程中发现自己的推导出现矛盾或需要"重新考虑"，
+  立即停止并换题，不得修补后继续输出
+- 任何例题的解题过程中，禁止出现对题目数据的质疑、
+  对自身推导的否定、或"题目有误"等表述。
+  若代入验证失败，直接输出换题后的新题目和完整解答，
+  不解释换题原因，不保留任何失败推导片段。
+- 优先使用参考资料中的真题或改编题；
+  若实在无题可用，只允许对已有真题修改数据后使用，
+  禁止从零自编全新题目。
+- 如果某道题完整写出需要超过20行推导，换一道计算量适中、能完整给出满分答案的题
 
 【LaTeX格式要求】
-- 严格参照【格式模板】，导言区必须与模板完全一致（包含needspace、multirow宏包和blankbox样式）
-- 数学公式：行内$...$，行间用align*环境并手动用\\\\在合适位置换行，禁止出现整行公式超出页面右边界
-- 中文文本和行内公式之间不要有额外空格，xeCJK会自动处理间距，无需手动用\\quad或空格隔开
-- 大段数学推导使用align*环境分行展示，每行一个等号对齐，禁止把长公式全部写在一行align*内
-- 使用 tcolorbox 的三种样式：answerbox（答案/解题过程）、theorybox（要点）、tipbox（易错），全部加breakable选项
-- 表格列宽一律用p{{Xcm}}指定，禁止用l列放无限长内容
-- tcolorbox内中文句子中夹杂的变量名（如"P在直线AF上"）不要单独用$...$包裹，直接写成普通文字或改用\\textit{{}}，避免产生异常字间距
-- 每道例题（题目行+解答box）前必须加\\needspace{{20\\baselineskip}}；综合例题前加\\needspace{{25\\baselineskip}}
-- 若例题解答特别长（超过半页），在例题标题行前改用\\newpage强制换页
-- 各章节之间的\\newpage只用一次（放在章节标题之前）。禁止在章节标题之后紧接着又放一个\\newpage，否则会造成"只有标题的空白页"
-- 禁止使用\\multirow命令，因为需要额外宏包容易引发编译错误。表格有多行合并需求时改用空白行替代
-- 输出完整可编译的LaTeX代码，从\\documentclass开始到\\end{{document}}结束
-- 不要任何解释，只输出LaTeX代码
+- 严格参照格式模板，导言区与模板完全一致（含needspace、makecell，禁止使用forest包）
+- 知识框架必须用tikz child语法画树状图，节点样式与模板示例完全一致，grow=right方向
+- tikz child树状图最多两层（根→一级→二级），严禁三层child嵌套，否则节点重叠
+- 每个一级节点最多2个二级子节点，超过2个会导致重叠
+- 数学公式：行内$...$，行间用align*环境分行，禁止长公式溢出页面
+- tcolorbox全部加breakable选项
+- 表格列宽用p{{Xcm}}指定，禁止l列
+- 例题前加\\needspace{{12\\baselineskip}}，综合例题前加\\needspace{{15\\baselineskip}}
+- \\needspace禁止紧跟\\section*或\\subsection*之后
+- 禁止\\multirow；禁止在章节标题后立即\\newpage
+- 输出完整LaTeX代码，从\\documentclass到\\end{{document}}，不要任何解释
 
 【格式模板】
 {LATEX_FORMAT_EXAMPLE}
@@ -330,130 +448,243 @@ def build_prompt(topic: str, module: str, key_points: list[str], reference: str)
 {reference if reference else "（未找到相关PDF，请基于知识点自行编写高质量题目）"}
 """
 
-# ── LLM调用 ───────────────────────────────────────────────────────────────────
-
+# ── LLM ──────────────────────────────────────────────────────────────────────
 def call_llm(prompt: str) -> str:
     log.info("  调用 DeepSeek-V4-Pro 生成讲义...")
     resp = client.chat.completions.create(
         model=MODEL,
         max_tokens=MAX_TOKENS,
+        temperature=0,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": prompt}
         ]
     )
-    return resp.choices[0].message.content.strip()
+    choice = resp.choices[0]
+    if choice.finish_reason == "length":
+        log.warning("  ⚠️ 输出被token限制截断！考虑增大MAX_TOKENS或缩短参考资料")
+    return choice.message.content.strip()
 
 def extract_latex(raw: str) -> str:
-    if "```" in raw:
-        parts = raw.split("```")
-        for i, part in enumerate(parts):
-            if i % 2 == 1:
-                code = part
-                if code.startswith("latex") or code.startswith("tex"):
-                    code = code[code.index("\n")+1:]
-                raw = code
-                break
-    if "\\documentclass" in raw:
-        raw = raw[raw.index("\\documentclass"):]
+    # 直接提取\documentclass到\end{document}之间的内容
+    # 保留中间的```json```块，inject_figures_into_latex会处理它们
+    start = raw.find("\\documentclass")
+    end = raw.rfind("\\end{document}")
+    if start != -1 and end != -1:
+        return raw[start:end + len("\\end{document}")].strip()
+    elif start != -1:
+        return raw[start:].strip()
+    # 兜底：去掉外层markdown代码块标记
+    raw = re.sub(r'^```[a-z]*\n', '', raw.strip())
+    raw = re.sub(r'\n```$', '', raw)
     return raw.strip()
 
-
+# ── sanitize ─────────────────────────────────────────────────────────────────
 def sanitize_latex(tex: str) -> str:
-    r"""自动修复 LLM 输出的 LaTeX 中常见低级错误。
-
-    修复项：
-      - 全角右括号 `)` 代替半角 `]` 关闭 tcolorbox option（最常见）
-      - 全角左括号 `（` 代替半角 `[` 开启 tcolorbox option
-      - 空白的 \usepackage 行
-
-      - \begin{enumerate} 后跟空白参数等
-    """
-    # 1. 修复 tcolorbox: \begin{tcolorbox}[...]） → \begin{tcolorbox}[...]
-    tex = re.sub(
-        r'(\\begin\{tcolorbox\}\[[^\]]*\])\）',
-        r'\1]',
-        tex
-    )
-
-    # 2. 修复全角左括号：\begin{tcolorbox}（...】) → \begin{tcolorbox}[...】]
-    tex = re.sub(
-        r'(\\begin\{tcolorbox\})（([^）]*?)】\)',
-        r'\1[\2】]',
-        tex
-    )
-
-
-    # 3. 修复全角左括号：】） → 】]
+    tex = re.sub(r'(title=\{[^}]*)【([^}]*)】([^}]*\})', 
+             r'\1\2\3', tex)
+    # -1. 删除forest环境
+    tex = re.sub(r'\\begin\{forest\}.*?\\end\{forest\}',
+                 r'% [forest removed]', tex, flags=re.DOTALL)
+    # 0. 注入缺失宏包
+    for _pkg in ['makecell', 'subfigure']:
+        if f'\\usepackage{{{_pkg}}}' not in tex and f'\\{_pkg}' in tex:
+            tex = tex.replace(r'\begin{document}',
+                              f'\\usepackage{{{_pkg}}}\n\\begin{{document}}', 1)
+    # -0.5 修复 \degree 为 ^\circ
+    tex = tex.replace(r'\degree', r'^\circ')
+    # 0.5 tcolorbox title多余右括号
+    tex = re.sub(r'(\\begin\{tcolorbox\}\[[^\]]*title=\{[^}]*)\}\}', r'\1}', tex)
+    # 1-5. tcolorbox括号修复
+    tex = re.sub(r'(\\begin\{tcolorbox\}\[[^\]]*\])\）', r'\1]', tex)
+    tex = re.sub(r'(\\begin\{tcolorbox\})（([^）]*?)】\)', r'\1[\2】]', tex)
     tex = tex.replace('】）', '】]')
-
-    # 4. \end{tcolorbox}）→ \end{tcolorbox} （行尾有多余全角括号）
     tex = tex.replace(r'\end{tcolorbox}）', r'\end{tcolorbox}')
-
-    # 5. 修复\end{...}后有全角括号杂质的
     tex = re.sub(r'(\\end\{[^}]+\})[）\)]', r'\1', tex)
-
-    # 6. 修复空白的无用行：只有 \usepackage{} 没有宏包名
+    # 6. 空usepackage
     tex = re.sub(r'^\s*\\usepackage\{\}\s*$', '', tex, flags=re.MULTILINE)
+    # 7-8. 删除section后的needspace
+    tex = re.sub(
+        r'(\\section\*\{[^}]*\}|\\subsection\*\{[^}]*\})\s*\\needspace\{[^}]*\}',
+        r'\1', tex)
+    tex = re.sub(
+        r'(\\section\*\{[^}]*\}|\\subsection\*\{[^}]*\})\s*\n\s*\\needspace\{[^}]*\}',
+        r'\1', tex, flags=re.MULTILINE)
+    # 9. needspace值限制
+    lines = tex.split("\n")
+    new_lines = []
+    for l in lines:
+        m = re.search(r'\\needspace\{(\d+)\\baselineskip\}', l)
+        if m:
+            val = int(m.group(1))
+            if val >= 20:
+                lookback = " ".join(new_lines[-10:] if len(new_lines) >= 10 else new_lines)
+                new_val = 15 if "综合例题" in lookback else 12
+                l = l.replace(f"\\needspace{{{val}\\baselineskip}}",
+                               f"\\needspace{{{new_val}\\baselineskip}}")
+        new_lines.append(l)
+    tex = "\n".join(new_lines)
+    # 10. tikz circle修复
+    tex = re.sub(r'(circle\s*\()([a-z]+)(\s*\()', r'\1{\2\3', tex, flags=re.IGNORECASE)
+    tex = re.sub(r'(circle\s*\{[a-z]+\()([^)]*)\)\s*\)', r'\1\2)}', tex)
+    # 11. resizebox包裹tikzpicture（不包裹child树）
+    tex = tex.replace(r'\resizebox{\textwidth}', r'\resizebox{0.55\textwidth}')
+    tex = re.sub(
+        r'(\\begin\{center\}\s*)(\\begin\{tikzpicture\}.*?\\end\{tikzpicture\})(\s*\\end\{center\})',
+        lambda m: m.group(1) + (
+            r'\resizebox{0.55\textwidth}{!}{' + m.group(2) + '}'
+            if 'child {' not in m.group(2) and 'child{' not in m.group(2)
+            else m.group(2)
+        ) + m.group(3),
+        tex, flags=re.DOTALL
+    )
+    # 12. 删除grid网格
+    tex = re.sub(r'^\s*\\draw\[.*?grid.*?\].*?;\s*$', '', tex, flags=re.MULTILINE)
+    # 12.5 删除非right的grow方向
+    tex = re.sub(r'grow\s*=\s*(down|up|left|west|north|south)\s*,?\s*', '', tex)
+    tex = re.sub(r',\s*grow\s*=\s*(down|up|left|west|north|south)', '', tex)
+    # 13. 黑白化
+    def _bw(m):
+        s = m.group(0)
+        for c in ['blue','red','green!60','green','cyan','magenta',
+                  'yellow','orange','violet','purple','teal']:
+            s = s.replace(c, 'black')
+        return s
+    tex = re.sub(r'\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}',
+                 _bw, tex, flags=re.DOTALL)
+    # 14. \tikzpicture裸命令修复
+    tex = tex.replace(r'\begin{tikzpicture}', '<<<BEG>>>')
+    tex = tex.replace(r'\end{tikzpicture}',   '<<<END>>>')
+    tex = tex.replace(r'\tikzpicture', '点')
+    tex = tex.replace('点点', '点')
+    tex = tex.replace('<<<BEG>>>', r'\begin{tikzpicture}')
+    tex = tex.replace('<<<END>>>', r'\end{tikzpicture}')
+    # 14.5 修复截断文件
+    _end_doc = '\\end{document}'
+    if _end_doc not in tex:
+        for _env, _close in [('tcolorbox', '\\end{tcolorbox}'),
+                               ('tikzpicture', ';\n\\end{tikzpicture}\n\\end{center}'),
+                               ('enumerate', '\\end{enumerate}'),
+                               ('itemize', '\\end{itemize}')]:
+            _nb = tex.count(f'\\begin{{{_env}}}')
+            _ne = tex.count(f'\\end{{{_env}}}')
+            for _ in range(_nb - _ne):
+                tex = tex.rstrip() + '\n' + _close + '\n'
+        tex = tex.rstrip() + '\n\\end{document}\n'
+    else:
+        _last = tex.rindex(_end_doc)
+        tex = tex[:_last + len(_end_doc)] + '\n'
+    # 15. 删除含反引号的非法\node
+    tex = re.sub(r'\\node[^;\n]*`[^;\n]*;', '', tex)
+    # 16. tikz plot缺\x修复
+    tex = re.sub(
+        r'(plot\[domain[^\]]*\]\s*)\((\{)(?![^}]*\\x)',
+        lambda m: m.group(1) + '({\\x},' + m.group(2), tex)
+    # 17.5 tikzpicture环境配对检查
+    if tex.count(r'\begin{tikzpicture}') != tex.count(r'\end{tikzpicture}'):
+        tex = re.sub(
+            r'\\begin\{tikzpicture\}(?:(?!\\end\{tikzpicture\}).)*$',
+            '% [unclosed tikzpicture removed]',
+            tex, flags=re.DOTALL | re.MULTILINE)
+    # 17.6 child节点\\换行修复
+    # 在tikz child节点里，把换行命令替换为斜杠分隔
+    def _fix_node_newline(m):
+        s = m.group(0)
+        # 替换节点文本中所有换行为斜杠
+        s = re.sub(
+            r'(node\s*\{[^}]*?)\\\\([^}]*?\})',
+            lambda x: x.group(1) + '/' + x.group(2),
+            s
+        )
+        s = re.sub(
+        r'(node\s*\{[^}]*?)\\newline\s*([^}]*?\})',
+        lambda x: x.group(1) + '/' + x.group(2),
+        s
+        )
+        return s
 
+    tex = re.sub(
+        r'\\begin\{tikzpicture\}.*?\\end\{tikzpicture\}',
+        _fix_node_newline,
+        tex,
+        flags=re.DOTALL
+    )
+    # 18. 修复tcolorbox title中的数学命令（\triangle等在\csname中非法）
+    _title_replacements = {
+        r'\triangle': '△',
+        r'\angle':    '∠',
+        r'\perp':     '⊥',
+        r'\parallel': '∥',
+        r'\cdot':     '·',
+        r'\times':    '×',
+        r'\leq':      '≤',
+        r'\geq':      '≥',
+        r'\neq':      '≠',
+        r'\infty':    '∞',
+        r'\pi':       'π',
+        r'\alpha':    'α',
+        r'\beta':     'β',
+        r'\gamma':    'γ',
+        r'\theta':    'θ',
+        r'\lambda':   'λ',
+        r'\mu':       'μ',
+        r'\sigma':    'σ',
+        r'\omega':    'ω',
+        r'\sqrt':     '√',
+        r'\pm':       '±',
+    }
+    def _fix_tcolorbox_title(m):
+        full = m.group(0)
+        title_m = re.search(r'(title=\{)([^}]*?)(\})', full)
+        if not title_m:
+            return full
+        content = title_m.group(2)
+        for cmd, uni in _title_replacements.items():
+            content = content.replace(cmd, uni)
+        # 删除剩余未处理的\命令（兜底，避免遗漏）
+        content = re.sub(r'\\[a-zA-Z]+\*?', '', content)
+        # 删除残留的$符号
+        content = content.replace('$', '')
+        return full[:title_m.start(2)] + content + full[title_m.end(2):]
+
+    tex = re.sub(
+        r'\\begin\{tcolorbox\}\[[^\[\]]*title=\{[^}]*\}[^\[\]]*\]',
+        _fix_tcolorbox_title, tex
+    )
     return tex
 
-
-# ── 学生版后处理 ──────────────────────────────────────────────────────────────
-
+# ── 学生版 ────────────────────────────────────────────────────────────────────
 def strip_answers_for_student(tex: str) -> str:
-    """
-    将教师版LaTeX（含答案）转换为学生版（无答案，留出答题区域）。
-
-    规则：
-    - answerbox 中的【答案速查】→ 直接删除整个 box
-    - answerbox 中的【解题过程】→ 替换为 blankbox 空白答题区（虚线框 + vspace）
-    - answerbox 中的【练习参考答案】→ 直接删除整个 box
-    - 其他 answerbox → 替换为空白 box
-    """
-
-    def _replace_answerbox(match):
+    def _replace(match):
         full = match.group(0)
-        # 提取标题
         title_m = re.search(r'title=\{([^}]*)\}', full[:300])
         title = title_m.group(1) if title_m else ""
-
-        # 根据标题决定处理方式
         if "答案速查" in title or "参考答案" in title:
-            # 直接删除
             return ""
         elif "解题过程" in title or "解题" in title:
-            # 替换为空白答题区（虚线框）
-            return (
-                r"\begin{tcolorbox}[blankbox, title={" + title + r"}]"
-                "\n\\vspace{8cm}\n"
-                r"\end{tcolorbox}"
-            )
+            return (r"\begin{tcolorbox}[blankbox, title={" + title + r"}]"
+                    "\n\\vspace{8cm}\n" r"\end{tcolorbox}")
         else:
-            # 其他 answerbox → 通用空白框
-            return (
-                r"\begin{tcolorbox}[blankbox, title={" + title + r"}]"
-                "\n\\vspace{6cm}\n"
-                r"\end{tcolorbox}"
-            )
-
-    # 匹配完整的 answerbox 环境（从 \begin 到 \end，允许跨行）
-    pattern = (
-        r'\\begin\{tcolorbox\}\[answerbox[^\]]*\]'  # opening
-        r'.*?'                                        # content (lazy)
-        r'\\end\{tcolorbox\}'                         # closing
-    )
-    tex = re.sub(pattern, _replace_answerbox, tex, flags=re.DOTALL)
-
-    # 标题标注"学生版"
-    tex = tex.replace(
-        r"高中数学·",
-        r"高中数学·学生版·"
-    )
-
+            return (r"\begin{tcolorbox}[blankbox, title={" + title + r"}]"
+                    "\n\\vspace{6cm}\n" r"\end{tcolorbox}")
+    pattern = r'\\begin\{tcolorbox\}\[answerbox[^\]]*\].*?\\end\{tcolorbox\}'
+    tex = re.sub(pattern, _replace, tex, flags=re.DOTALL)
+    tex = tex.replace(r"高中数学·", r"高中数学·学生版·")
     return tex
 
-# ── LaTeX编译 ─────────────────────────────────────────────────────────────────
+# ── 编译 ──────────────────────────────────────────────────────────────────────
+FIX_PROMPT = """\
+以下LaTeX代码使用xelatex编译时报错，请修复后输出完整代码。
+
+【错误信息】：
+{error}
+
+【原代码】：
+{tex}
+
+只输出完整LaTeX代码，不要任何解释，不要markdown代码块。
+修复方向：未转义特殊字符、不匹配括号/环境、缺失宏包（makecell）、tcolorbox参数错误。注意：禁止使用forest包，树状图用tikz child语法。
+"""
 
 def parse_error(log_text: str) -> str:
     lines = log_text.split("\n")
@@ -465,29 +696,33 @@ def parse_error(log_text: str) -> str:
     return error[:600] if error else log_text[-600:]
 
 def compile_once(tex_path: Path, out_dir: Path) -> tuple[bool, str]:
+    pdf_path = out_dir / tex_path.with_suffix(".pdf").name
+    if pdf_path.exists():
+        for retry in range(4):
+            try:
+                pdf_path.unlink()
+                break
+            except PermissionError:
+                if retry < 3:
+                    _time.sleep(1)
     try:
         result = subprocess.run(
             [LATEX_CMD] + LATEX_OPTS + [f"-output-directory={out_dir}", str(tex_path)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             cwd=tex_path.parent
         )
-        log_output = (result.stdout or "") + (result.stderr or "")
-        return result.returncode == 0, log_output
+        return result.returncode == 0, (result.stdout or "") + (result.stderr or "")
     except FileNotFoundError:
         return False, f"未找到命令: {LATEX_CMD}"
     except Exception as e:
         return False, str(e)
 
 def compile_latex(tex_path: Path) -> Path | None:
-    """编译LaTeX为PDF。如果xelatex不可用，返回None并打印警告，不会抛出异常。"""
     PDF_OUT_DIR.mkdir(parents=True, exist_ok=True)
     tex_path = tex_path.resolve()
-
-    # 检查xelatex是否可用
     if not shutil.which(LATEX_CMD):
-        log.warning(f"  ⚠️ 未找到 '{LATEX_CMD}'，跳过PDF编译。TeX源文件已保存。")
+        log.warning("  [skip] 未找到xelatex，跳过编译")
         return None
-
     for attempt in range(1, MAX_RETRIES + 1):
         log.info(f"  编译尝试 {attempt}/{MAX_RETRIES}")
         success, log_text = True, ""
@@ -497,23 +732,29 @@ def compile_latex(tex_path: Path) -> Path | None:
             if not ok:
                 success = False
                 break
-
         pdf_path = PDF_OUT_DIR / tex_path.with_suffix(".pdf").name
         if success and pdf_path.exists():
-            log.info(f"  ✅ 编译成功: {pdf_path}")
-            # 清理本次编译过程中产生的备份文件
+            log.info(f"  [ok] 编译成功: {pdf_path}")
             for bak in tex_path.parent.glob(tex_path.stem + ".bak*.tex"):
                 bak.unlink(missing_ok=True)
             return pdf_path
-
         error = parse_error(log_text)
-        log.warning(f"  ❌ 编译失败:\n{error}")
-
-        # 不再调用DeepSeek自动修复——费Token且很少成功
-        # 直接report失败，用户可手动修改LaTeX
-        log.error(f"  💀 编译失败，请手动检查: {tex_path}")
-        return None
-
+        log.warning(f"  [fail] 编译失败:\n{error}")
+        if attempt < MAX_RETRIES:
+            log.info("  🔧 调用DeepSeek修复LaTeX...")
+            try:
+                resp = client.chat.completions.create(
+                    model=MODEL, max_tokens=MAX_TOKENS,
+                    messages=[{"role": "user", "content": FIX_PROMPT.format(
+                        error=error, tex=tex_path.read_text(encoding="utf-8"))}]
+                )
+                fixed = sanitize_latex(extract_latex(resp.choices[0].message.content))
+                shutil.copy(tex_path, tex_path.with_suffix(f".bak{attempt}.tex"))
+                tex_path.write_text(fixed, encoding="utf-8")
+            except Exception as e:
+                log.warning(f"  LLM修复失败: {e}")
+        else:
+            log.error(f"  [abort] 请手动检查: {tex_path}")
     return None
 
 def clean_aux(stem: str):
@@ -523,104 +764,73 @@ def clean_aux(stem: str):
             f.unlink()
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
-
 def generate(topic: str, mode: str = "teacher") -> list[Path]:
-    """
-    生成讲义。
-    
-    mode: "teacher" | "student" | "both"
-    返回生成的文件路径列表。
-    """
+    need_tikz = topic in TIKZ_TOPICS
     if topic not in SYLLABUS:
-        log.error(f"topic '{topic}' 不在课程大纲中，可用topic：")
+        log.error(f"topic '{topic}' 不在课程大纲中")
         for t in SYLLABUS:
             print(f"  {t}")
         return []
-
-    info       = SYLLABUS[topic]
-    module     = info["module"]
-    key_points = info["key_points"]
-
+    info = SYLLABUS[topic]
     log.info(f"{'='*60}")
-    log.info(f"生成讲义: {topic} [{module}] (模式: {mode})")
+    log.info(f"生成讲义: {topic} [{info['module']}] (模式: {mode})")
     log.info(f"{'='*60}")
-
-    log.info("Step 1/3: 收集PDF参考资料")
     reference = collect_reference_texts(topic, PDF_DIR)
-
-    log.info("Step 2/3: 生成LaTeX讲义（教师版）")
-    prompt = build_prompt(topic, module, key_points, reference)
-    raw    = call_llm(prompt)
-    latex  = extract_latex(raw)
-    latex  = sanitize_latex(latex)
-
-
+    prompt = build_prompt(topic, info["module"], info["key_points"], reference)
+    raw   = call_llm(prompt)
+    latex = sanitize_latex(extract_latex(raw))
+    if need_tikz:
+        latex = inject_figures_into_latex(latex)   # ← 加这一行
     TEX_DIR.mkdir(parents=True, exist_ok=True)
     safe = topic.replace("/", "_").replace("\\", "_")
-
     results = []
-
-    # ── 教师版 ──
     if mode in ("teacher", "both"):
         tex_path = TEX_DIR / f"{safe}.tex"
         tex_path.write_text(latex, encoding="utf-8")
-        log.info(f"  LaTeX已写出: {tex_path} ({len(latex)}字符)")
+        log.info(f"  LaTeX: {tex_path} ({len(latex)}字符)")
         results.append(tex_path)
-
-        log.info("Step 3/3: 编译教师版PDF")
-        pdf_path = compile_latex(tex_path)
-        if pdf_path:
+        pdf = compile_latex(tex_path)
+        if pdf:
             clean_aux(safe)
-            results.append(pdf_path)
-
-    # ── 学生版 ──
+            results.append(pdf)
     if mode in ("student", "both"):
-        student_tex = strip_answers_for_student(latex)
-        student_tex_path = TEX_DIR / f"{safe}_学生版.tex"
-        student_tex_path.write_text(student_tex, encoding="utf-8")
-        log.info(f"  学生版LaTeX已写出: {student_tex_path} ({len(student_tex)}字符)")
-        results.append(student_tex_path)
-
-        log.info("  编译学生版PDF")
-        pdf_path = compile_latex(student_tex_path)
-        if pdf_path:
+        stex = strip_answers_for_student(latex)
+        sp = TEX_DIR / f"{safe}_学生版.tex"
+        sp.write_text(stex, encoding="utf-8")
+        log.info(f"  学生版LaTeX: {sp}")
+        results.append(sp)
+        pdf = compile_latex(sp)
+        if pdf:
             clean_aux(f"{safe}_学生版")
-            results.append(pdf_path)
-
+            results.append(pdf)
     return results
 
-
 def main():
-    parser = argparse.ArgumentParser(description="生成高中数学课时讲义（教师版/学生版）")
-    parser.add_argument("topic", nargs="?", help="讲义主题（如 抛物线方程）")
-    parser.add_argument("--mode", choices=["teacher", "student", "both"], default="teacher",
-                        help="生成模式：teacher（教师版）、student（学生版）、both（两者）")
-    parser.add_argument("--all", action="store_true", help="生成所有主题的讲义")
+    parser = argparse.ArgumentParser(description="高中数学讲义生成器 v4")
+    parser.add_argument("topic", nargs="?")
+    parser.add_argument("--mode", choices=["teacher","student","both"], default="teacher")
+    parser.add_argument("--all", action="store_true")
     args = parser.parse_args()
-
     if args.all:
         results = []
         for topic in SYLLABUS:
             pdfs = generate(topic, mode=args.mode)
-            status = "✅" if pdfs else "❌"
-            files = ", ".join(str(p) for p in pdfs) if pdfs else "编译失败"
-            results.append((topic, status, files))
+            results.append((topic, "OK" if pdfs else "FAIL",
+                            ", ".join(str(p) for p in pdfs)))
             print()
-        print("\n" + "=" * 60)
-        print("生成结果汇总：")
+        print("\n" + "="*60)
         for t, s, p in results:
-            print(f"  {s} {t:<25} → {p}")
+            print(f"  {s} {t:<25} -> {p}")
     elif args.topic:
         pdfs = generate(args.topic, mode=args.mode)
         if pdfs:
-            print(f"\n✅ 完成：")
+            print("\n完成：")
             for p in pdfs:
                 print(f"   {p}")
         else:
-            print(f"\n❌ 失败，请检查 output/tex/{args.topic}.tex")
+            print(f"\n失败，请检查 output/tex/{args.topic}.tex")
     else:
         parser.print_help()
-
 
 if __name__ == "__main__":
     main()
