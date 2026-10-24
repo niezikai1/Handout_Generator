@@ -26,7 +26,7 @@ PDF_OUT_DIR = BASE_DIR / "output" / "pdf"
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 MODEL       = "deepseek-v4-pro"
 MAX_TOKENS  = 40000
-LATEX_CMD   = r"C:\Users\Kevin\AppData\Local\Programs\MiKTeX\miktex\bin\x64\xelatex.exe"
+LATEX_CMD   = os.environ.get("XELATEX_PATH") or shutil.which("xelatex") or "xelatex"  # override via XELATEX_PATH in .env
 LATEX_OPTS  = ["-interaction=nonstopmode", "-halt-on-error"]
 MAX_RETRIES = 3
 
