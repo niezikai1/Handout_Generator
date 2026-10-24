@@ -1,5 +1,7 @@
 # Handout Generator
 
+English | [简体中文](README.zh-CN.md)
+
 An LLM-driven pipeline that turns reference PDFs into typeset high-school math handouts (LaTeX → PDF), in a **teacher edition** (with full solutions) and a **student edition** (solutions replaced by blank answer space).
 
 Built as a freelance project for a tutoring client; used to produce handouts for 30+ topics in analytic geometry and probability & statistics. Handout content is in Chinese.
